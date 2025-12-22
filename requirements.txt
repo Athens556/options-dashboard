@@ -1,0 +1,9 @@
+streamlit
+pandas
+numpy
+jugaad-data
+yfinance
+py_vollib_vectorized
+plotly
+scipy
+kiteconnect

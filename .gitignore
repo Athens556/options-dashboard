@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.env
+
+# Streamlit
+.streamlit/secrets.toml
+
+# Project Data
+data/
+market_research.db
+trends_cache.json
+*.zip
+*.csv
+
+# IDE
+.vscode/
+.idea/
