@@ -2,7 +2,11 @@
 
 A comprehensive, modular dashboard for analyzing options market data, identifying regimes, and generating strategy recommendations using a hybrid approach of classical technical analysis and novel "Narrative" context.
 
-<!-- ![Dashboard Preview](screenshots/dashboard_mockup.png) -->
+## Screenshots
+
+| Dashboard View | Market Gym View |
+|:---:|:---:|
+| ![Dashboard](screenshots/Screenshot_22-12-2025_214054_localhost.jpeg) | ![Market Gym](screenshots/Screenshot_22-12-2025_214125_localhost.jpeg) |
 
 ## Features
 
@@ -12,15 +16,21 @@ A comprehensive, modular dashboard for analyzing options market data, identifyin
     - **Guardrails**: Enforces strict causality to prevent look-ahead bias in backtests.
     - **Narrative Awareness**: Integrates external signals (News, Events) into the decision framework.
 - **Strategy Backtesting**: Simulate strategies like Iron Condor, Straddles, and Spreads against historical data.
-- **Machine Learning Integration**:
+- **Active Learning System (Experimental)**:
     - **Context Encoder**: Uses a transformer-based model to learn "Token Attention" — which market factors matter most for distinct strategies.
     - **Tokenization**: Converts complex market states into discrete, interpretable tokens (e.g., `VOL_HIGH`, `TRENDING_UP`).
+
+> [!WARNING]
+> **API Disclaimer**: Some data sources included (e.g., Sensibull, TradingView) effectively use unofficial APIs. They are provided for demonstration purposes and may break at any time or violate Terms of Service. Use official APIs (DhanHQ, Kite) for reliability.
+
+> [!NOTE]
+> **IV Data Availability**: Implied Volatility (IV) data is strictly calculated using Black-Scholes models on NSE Options Chain data (Bhavcopy). Some external APIs (like IndianAPI, Dhan) do not currently provide historical IV data, so volatility features may be limited for those sources.
 
 ## Installation
 
 1.  **Clone the repository**:
     ```bash
-    git clone https://github.com/yourusername/options-dashboard.git
+    git clone https://github.com/athens556/options-dashboard.git
     cd options-dashboard
     ```
 

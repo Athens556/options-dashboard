@@ -443,7 +443,7 @@ def render_market_gym():
                 st.write("🧠 **Active Learning System**")
                 with st.spinner("Training Context Transformer on new data..."):
                     try:
-                        from trainer import Trainer
+                        from modules.ml.trainer import Trainer
                         # Initialize Trainer
                         t = Trainer()
                         # Train on the trades we just simulated
