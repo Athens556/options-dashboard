@@ -1,184 +1,123 @@
+"""Vectorized options backtest.
+
+Every strategy is simulated on *every* day ("shadow trades"): legs priced with
+Black-Scholes at entry IV, settled at intrinsic value after `hold_days` trading
+days. The rule-based entries are the subset flagged `is_signal`. Shadow trades
+give the context model dense, unbiased training data; signals are what a
+rules-only trader would have taken.
+"""
+from dataclasses import dataclass
+
+import numpy as np
 import pandas as pd
-from datetime import timedelta, date
-from typing import List, Dict, Any
-from .market_state import MarketStateBuilder, MarketState
-from modules.ml.tokens import Tokenizer
-from .db_manager import DBManager
-from .strategy import BaseStrategy
-from . import strategy as strategies
-from modules.ml.token_signature import TokenSignature
+
+from modules.ml.tokens import SLOTS, Tokenizer
+from modules.utils import TRADING_DAYS, bs_price
+from .market_state import build_feature_frame
+from .strategy import STRATEGIES, Strategy
+
+SLIPPAGE = 0.03  # fraction of gross premium lost to spreads/fees per round trip
+
+
+@dataclass
+class BacktestResult:
+    features: pd.DataFrame
+    tokens: pd.DataFrame
+    trades: pd.DataFrame  # all shadow trades; `is_signal` marks rule entries
+
+
+def price_strategy(strategy: Strategy, s0, st, iv):
+    """Per-unit PnL, capital at risk and ROI% for arrays of entries. Returns dict of arrays."""
+    t = strategy.hold_days / TRADING_DAYS
+    move = iv / 100 * np.sqrt(t)
+    entry_cost = np.zeros_like(s0)  # >0 debit, <0 credit
+    gross = np.zeros_like(s0)
+    strikes = []
+    for leg in strategy.legs:
+        k = s0 * np.exp(leg.k * move)
+        prem = bs_price(leg.flag, s0, k, t, iv / 100)
+        entry_cost += leg.qty * prem
+        gross += prem
+        strikes.append((leg, k))
+
+    def settle(price):
+        value = np.zeros_like(s0)
+        for leg, k in strikes:
+            intrinsic = np.maximum(price - k, 0) if leg.flag == "c" else np.maximum(k - price, 0)
+            value += leg.qty * intrinsic
+        return value
+
+    # Worst case over a payoff-kink grid (payoffs are piecewise linear; all our structures are bounded).
+    probes = [np.zeros_like(s0), s0 * 10] + [k for _, k in strikes]
+    worst_value = np.min([settle(p) for p in probes], axis=0)
+    risk = np.maximum(entry_cost - worst_value, 1e-9)
+
+    pnl = settle(st) - entry_cost - SLIPPAGE * gross
+    return {"pnl": pnl, "risk": risk, "roi": pnl / risk * 100, "premium": entry_cost}
+
 
 class BacktestEngine:
-    def __init__(self, symbol, start_date, end_date):
+    def __init__(self, symbol: str, market_df: pd.DataFrame, strategies=None):
         self.symbol = symbol
-        self.start_date = start_date
-        self.end_date = end_date
-        self.db = DBManager()
-        self.builder = MarketStateBuilder()
-        
-    def load_data(self):
-        # Fetch from Sensibull as requested
-        from modules.api import data_loader
-        from modules import utils
-        print("Fetching data (Sensibull) for backtest...")
-        df = data_loader.fetch_sensibull_data(self.symbol)
-        
-        if df.empty:
-            return None
-            
-        # Prepare Dictionary format expected by engine
-        # Calculate RV
-        rv_series = utils.calculate_rv(df['close'])
-        
-        return {
-            'spot': df['close'],
-            'iv': df['iv'] if 'iv' in df.columns else pd.Series(),
-            'rv': rv_series,
-            'vix': df['vix'] if 'vix' in df.columns else pd.Series()
-        }
+        self.market_df = market_df
+        self.strategies = strategies or STRATEGIES
 
-    def run(self, strategies_to_test: List[BaseStrategy]) -> Dict[str, List]:
-        data = self.load_data()
-        if not data:
-            print("No data for backtest.")
-            return {"trades": [], "history": []}
+    def run(self) -> BacktestResult:
+        features = build_feature_frame(self.market_df)
+        tokens = Tokenizer.tokenize_frame(features)
+        if tokens.empty:
+            return BacktestResult(features, tokens, pd.DataFrame())
 
-        spot_series = data['spot']
-        iv_series = data['iv']
-        rv_series = data['rv']
-        
-        # Valid Dates
-        valid_dates = spot_series.index
-        valid_dates = [d for d in valid_dates if d >= self.start_date and d <= self.end_date]
-        
-        trades = []
-        history = []
-        
-        print(f"Running backtest on {len(valid_dates)} days...")
-        
-        for i, current_date in enumerate(valid_dates):
-            # Check for end of data
-            if i + 30 >= len(valid_dates):
-                 break
-                 
-            # Build State
-            state = self.builder.build_daily_state(
-                self.symbol, current_date, spot_series, iv_series, rv_series
-            )
-            
-            if not state: continue
-            
-            # Tokenize
-            tokens = Tokenizer.get_tokens(state)
-            
-            # Canonical Signature
-            token_sig = TokenSignature.create(tokens)
-            
-            # Log History for UI
-            history.append({
-                "date": current_date,
-                "spot": state.spot_price,
-                "iv_bucket": state.iv_bucket.name,
-                "trend_strength": state.trend_strength.name,
-                "tokens": tokens
-            })
-            
-            # Check Strategies
-            for strat in strategies_to_test:
-                reasoning = []
-                should_trade = False
-                
-                # Check Entry Loop
-                if strat.should_enter(tokens):
-                    should_trade = True
-                    reasoning.append(f"Tokens {tokens} matched filter.")
-                else:
-                    reasoning.append(f"Tokens {tokens} did not match filter.")
-                
-                if should_trade:
-                    # Simulate Trade
-                    result = self.simulate_trade(strat, spot_series, i, current_date)
-                    
-                    # Update Belief
-                    self.db.update_belief(strat.name, token_sig, result['win'])
-                    
-                    # Log Trade
-                    state_dict = state.to_dict()
-                    
-                    trades.append({
-                        "date": current_date,
-                        "strategy": strat.name,
-                        "tokens": tokens,
-                        "result": result,
-                        "state_snapshot": state_dict,
-                        "reasoning": "; ".join(reasoning)
-                    })
-                    
-        return {
-            "trades": trades,
-            "history": history
-        }
+        token_lists = tokens[SLOTS].to_numpy().tolist()
+        token_sets = [set(t) for t in token_lists]
+        signatures = [Tokenizer.signature(t) for t in token_lists]
+        pos = features.index.get_indexer(tokens.index)  # positions in the full series (exit lookup)
+        close = features["close"].to_numpy(float)
+        iv = features["iv"].to_numpy(float)[pos]
+        s0 = close[pos]
 
-    def simulate_trade(self, strategy: BaseStrategy, spot_series, current_idx, current_date) -> Dict:
-        """
-        Simulates trade outcome based on future price movement.
-        Simplified PnL logic.
-        """
-        exit_cond = strategy.get_exit_conditions()
-        max_days = exit_cond.get('max_days', 10)
-        
-        entry_price = spot_series.iloc[current_idx]
-        
-        # Look ahead
-        future_prices = spot_series.iloc[current_idx+1 : current_idx+max_days+1]
-        
-        if future_prices.empty:
-            return {"pnl": 0, "win": False, "roi": 0}
-            
-        exit_price = future_prices.iloc[-1]
-        
-        pnl = 0.0
-        
-        # Logic per strategy type (Approximation)
-        if "Debit Spread" in strategy.name:
-            if "Bull" in strategy.name:
-                pnl = exit_price - entry_price
-            else:
-                pnl = entry_price - exit_price
-                
-        elif "Straddle" in strategy.name:
-            # Long Straddle: Profit if moves away from entry
-            move = abs(exit_price - entry_price)
-            # Breakeven approx: needs to move > 1-2%? 
-            # Let's say 2% move is required to cover premium
-            premium_cost = entry_price * 0.02 
-            pnl = move - premium_cost
-            
-        elif "Iron Condor" in strategy.name:
-            # Short IC: Profit if stays within range
-            # Assume entry wings are +/- 5%
-            upper = entry_price * 1.05
-            lower = entry_price * 0.95
-            
-            max_pnl_potential = entry_price * 0.01 # Collected premium approx
-            
-            # Did it breach?
-            breached = ((future_prices > upper) | (future_prices < lower)).any()
-            
-            if breached:
-                pnl = -max_pnl_potential * 2 # Loss
-            else:
-                pnl = max_pnl_potential # Max Profit
-                
-        win = pnl > 0
-        return {"pnl": pnl, "win": win, "roi": (pnl/entry_price)*100}
+        frames = []
+        for strat in self.strategies:
+            exit_pos = pos + strat.hold_days
+            open_mask = exit_pos < len(close)  # exit must exist; trailing entries are still open
+            if not open_mask.any():
+                continue
+            st = close[exit_pos[open_mask]]
+            priced = price_strategy(strat, s0[open_mask], st, iv[open_mask])
+            idx = np.flatnonzero(open_mask)
+            frames.append(pd.DataFrame({
+                "date": tokens.index[idx],
+                "exit_date": features.index[exit_pos[open_mask]],
+                "strategy": strat.name,
+                "tokens": [token_lists[i] for i in idx],
+                "signature": [signatures[i] for i in idx],
+                "spot": s0[open_mask],
+                "exit_spot": st,
+                "iv": iv[open_mask],
+                "premium": priced["premium"],
+                "pnl": priced["pnl"],
+                "roi": priced["roi"],
+                "win": priced["pnl"] > 0,
+                "is_signal": [strat.should_enter(token_sets[i]) for i in idx],
+            }))
+        trades = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+        if not trades.empty:
+            trades.insert(0, "symbol", self.symbol)
+        return BacktestResult(features, tokens, trades)
 
-if __name__ == "__main__":
-    # Test Backtest
-    be = BacktestEngine("NIFTY", date.today() - timedelta(days=60), date.today())
-    results = be.run(strategies.get_all_strategies())
-    
-    print(f"\nBacktest Complete. Total Trades: {len(results['trades'])}")
-    if results['trades']:
-        df = pd.DataFrame(results['trades'])
-        print(df[['date', 'strategy', 'result']].head())
+
+def strategy_stats(trades: pd.DataFrame) -> pd.DataFrame:
+    """Per-strategy summary: trades, win rate, avg ROI, cumulative ROI and max drawdown (in ROI points)."""
+    rows = []
+    for name, g in trades.groupby("strategy", sort=False):
+        g = g.sort_values("date")
+        equity = g["roi"].cumsum()
+        rows.append({
+            "Strategy": name,
+            "Trades": len(g),
+            "Win rate": g["win"].mean() * 100,
+            "Avg ROI %": g["roi"].mean(),
+            "Total ROI %": equity.iloc[-1],
+            "Max DD %": (equity - equity.cummax()).min(),
+        })
+    return pd.DataFrame(rows)

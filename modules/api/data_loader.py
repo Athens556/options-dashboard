@@ -1,15 +1,19 @@
+"""Market data adapters.
+
+Every fetcher returns a DataFrame on a normalized DatetimeIndex with a `close`
+column plus whichever of `iv`, `vix`, `ivp` the source provides. Heavy SDKs
+(yfinance, jugaad-data, kiteconnect, dhanhq) are imported inside the function
+that needs them so the app starts fast.
+"""
 import pandas as pd
-import yfinance as yf
-from jugaad_data.nse import bhavcopy_fo_save, bhavcopy_save
 from datetime import date, timedelta, datetime
 import os
 from modules import utils
 import numpy as np
 import sys
 import contextlib
-from kiteconnect import KiteConnect
-from dhanhq import dhanhq
-from . import dhan_config
+
+HTTP_TIMEOUT = 15
 
 
 @contextlib.contextmanager
@@ -38,7 +42,7 @@ def fetch_nifty_fo_symbols():
     try:
         import requests
         import io
-        response = requests.get(url, headers=headers)
+        response = requests.get(url, headers=headers, timeout=HTTP_TIMEOUT)
         if response.status_code == 200:
             # Parse CSV
             df = pd.read_csv(io.StringIO(response.text))
@@ -57,11 +61,13 @@ def fetch_nifty_fo_symbols():
 
 def get_kite_login_url(api_key):
     """Returns the login URL for Kite Connect."""
+    from kiteconnect import KiteConnect
     kite = KiteConnect(api_key=api_key)
     return kite.login_url()
 
 def generate_kite_session(api_key, api_secret, request_token):
     """Generates a Kite session and returns the authenticated instance."""
+    from kiteconnect import KiteConnect
     kite = KiteConnect(api_key=api_key)
     data = kite.generate_session(request_token, api_secret=api_secret)
     kite.set_access_token(data["access_token"])
@@ -74,8 +80,8 @@ def fetch_kite_historical_data(kite, instrument_token, from_date, to_date, inter
         df = pd.DataFrame(records)
         if not df.empty:
             df.set_index('date', inplace=True)
-            # Kite returns timezone aware datetimes, ensure compatibility
-            df.index = df.index.date
+            # Kite returns timezone aware datetimes; strip to naive calendar days
+            df.index = pd.to_datetime([d.date() for d in df.index])
         return df
     except Exception as e:
         error_msg = str(e)
@@ -102,14 +108,14 @@ def fetch_indianapi_data(symbol, api_key):
     }
     
     try:
-        response = requests.get(base_url, params=params, headers=headers)
+        response = requests.get(base_url, params=params, headers=headers, timeout=HTTP_TIMEOUT)
         if response.status_code == 200:
             data = response.json()
             if 'datasets' in data and len(data['datasets']) > 0:
                 values = data['datasets'][0]['values']
                 # values is list of [date, price]
                 df = pd.DataFrame(values, columns=['date', 'close'])
-                df['date'] = pd.to_datetime(df['date']).dt.date
+                df['date'] = pd.to_datetime(df['date']).dt.normalize()
                 df['close'] = pd.to_numeric(df['close'])
                 df.set_index('date', inplace=True)
                 return df
@@ -129,7 +135,7 @@ def fetch_tv_data(symbol, exchange="NSE"):
         if df is not None and not df.empty:
             # df index is datetime, columns: symbol, open, high, low, close, volume
             df = df[['close']].copy()
-            df.index = df.index.date
+            df.index = pd.DatetimeIndex(df.index).normalize()
             return df
     except Exception as e:
         print(f"Error fetching TradingView data: {e}")
@@ -162,40 +168,26 @@ def fetch_sensibull_data(symbol):
     }
     
     try:
-        response = requests.post(url, headers=headers, json=payload)
+        response = requests.post(url, headers=headers, json=payload, timeout=HTTP_TIMEOUT)
         if response.status_code == 200:
             data = response.json()
             if 'payload' in data and 'chart_data' in data['payload']:
                 chart_data = data['payload']['chart_data']
-                
-                records = []
-                for timestamp, values in chart_data.items():
-                    record = {'date': timestamp}
-                    
-                    # Spot
-                    if 'spot' in values:
-                        record['close'] = values['spot']
-                        
-                    # IV
-                    if 'iv' in values and 'atm_iv' in values['iv']:
-                        record['iv'] = values['iv']['atm_iv']
-                        
-                    # India VIX
-                    if 'indiavix' in values and 'indiavix_price' in values['indiavix']:
-                        record['vix'] = values['indiavix']['indiavix_price']
-                        
-                    # IV Percentile
-                    if 'ivp' in values and 'ivp' in values['ivp']:
-                        record['ivp'] = values['ivp']['ivp']
-                        
-                    records.append(record)
-                    
+                records = [{
+                    'date': ts,
+                    'close': v.get('spot'),
+                    'iv': (v.get('iv') or {}).get('atm_iv'),
+                    'vix': (v.get('indiavix') or {}).get('indiavix_price'),
+                    'ivp': (v.get('ivp') or {}).get('ivp'),
+                } for ts, v in chart_data.items()]
+
                 df = pd.DataFrame(records)
                 if not df.empty:
-                    df['date'] = pd.to_datetime(df['date']).dt.date
-                    df.set_index('date', inplace=True)
-                    df.sort_index(inplace=True)
-                    return df
+                    # Timestamps carry +05:30; keep the IST calendar day
+                    df['date'] = pd.to_datetime(df['date'].str[:10])
+                    df = df.set_index('date').sort_index()
+                    df = df[~df.index.duplicated(keep='last')].apply(pd.to_numeric, errors='coerce')
+                    return df.dropna(axis=1, how='all')
     except Exception as e:
         print(f"Error fetching Sensibull data: {e}")
         
@@ -203,6 +195,8 @@ def fetch_sensibull_data(symbol):
 
 def get_dhan_client():
     """Returns authenticated Dhan client."""
+    from dhanhq import dhanhq
+    from . import dhan_config
     return dhanhq(dhan_config.CLIENT_ID, dhan_config.ACCESS_TOKEN)
 
 def fetch_dhan_security_id(symbol, exchange='NSE'):
@@ -331,9 +325,9 @@ def fetch_dhan_data(symbol, start_date, end_date):
                 if 'date' in df.columns:
                      # Check if numeric
                      if pd.api.types.is_numeric_dtype(df['date']):
-                         df['date'] = pd.to_datetime(df['date'], unit='s' if df['date'].iloc[0] > 1e9 else 'ns').dt.date
+                         df['date'] = pd.to_datetime(df['date'], unit='s' if df['date'].iloc[0] > 1e9 else 'ns').dt.normalize()
                      else:
-                         df['date'] = pd.to_datetime(df['date']).dt.date
+                         df['date'] = pd.to_datetime(df['date']).dt.normalize()
                      
                      df.set_index('date', inplace=True)
                      return df
@@ -465,23 +459,19 @@ def get_udiff_bhavcopy_data(date_obj):
         # Derive INSTRUMENT column
         # Check if already processed
         if 'INSTRUMENT' not in df.columns:
-            # Identify Indices
-            # Known indices in FO
-            indices = ["NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY"]
-            
-            def get_instrument(row):
-                symbol = row.get('SYMBOL')
-                opt_type = row.get('OPTION_TYP')
-                
-                is_index = symbol in indices
-                is_opt = isinstance(opt_type, str) and opt_type in ['CE', 'PE']
-                
-                if is_index:
-                    return 'OPTIDX' if is_opt else 'FUTIDX'
-                else:
-                    return 'OPTSTK' if is_opt else 'FUTSTK'
-                    
-            df['INSTRUMENT'] = df.apply(get_instrument, axis=1)
+            # Vectorized (was a row-wise apply over ~50k rows per file)
+            fin_map = {'IDO': 'OPTIDX', 'IDF': 'FUTIDX', 'STO': 'OPTSTK', 'STF': 'FUTSTK'}
+            if 'FinInstrmTp' in df.columns:
+                df['INSTRUMENT'] = df['FinInstrmTp'].map(fin_map)
+            else:
+                df['INSTRUMENT'] = None
+            missing = df['INSTRUMENT'].isna()
+            if missing.any():
+                indices = ["NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY"]
+                is_index = df['SYMBOL'].isin(indices)
+                is_opt = df['OPTION_TYP'].isin(['CE', 'PE'])
+                derived = np.select([is_index & is_opt, is_index, is_opt], ['OPTIDX', 'FUTIDX', 'OPTSTK'], 'FUTSTK')
+                df.loc[missing, 'INSTRUMENT'] = derived[missing.to_numpy()]
             
             # Save fully processed dataframe to disk
             # Overwrite if it was raw, or create new if downloaded
@@ -512,12 +502,14 @@ def get_bhavcopy_data(date_obj, type='fo'):
                 with lock_manager.get_lock(fname):
                     file_path = os.path.join(DATA_DIR, fname)
                     if not os.path.exists(file_path):
+                        from jugaad_data.nse import bhavcopy_fo_save
                         file_path = bhavcopy_fo_save(date_obj, DATA_DIR)
         elif type == 'eq':
             fname = f"cm{date_obj.strftime('%d%b%Y').upper()}bhav.csv"
             with lock_manager.get_lock(fname):
                 file_path = os.path.join(DATA_DIR, fname)
                 if not os.path.exists(file_path):
+                    from jugaad_data.nse import bhavcopy_save
                     file_path = bhavcopy_save(date_obj, DATA_DIR)
         else:
             return None
@@ -529,50 +521,35 @@ def get_bhavcopy_data(date_obj, type='fo'):
         return None
 
 def get_spot_data_from_index_bhavcopy(symbol, start_date, end_date):
-    """Fetches spot data from Index Bhavcopy."""
+    """Closing values for an index from the NSE index Bhavcopy, fetched in parallel."""
     from jugaad_data.nse import bhavcopy_index_save
-    spot_data = {}
-    current_date = start_date
-    
-    # This also needs simple iteration or we could parallelize, 
-    # but let's stick to parallelizing the main bottleneck (options data).
-    while current_date <= end_date:
-        if current_date.weekday() < 5:
-            try:
-                # Correct filename format: ind_close_all_DDMMYYYY.csv
-                fname = f"ind_close_all_{current_date.strftime('%d%m%Y')}.csv"
-                with lock_manager.get_lock(fname):
-                    file_path = os.path.join(DATA_DIR, fname)
-                    if not os.path.exists(file_path):
-                        # Timeout handling could be added here if needed, but jugaad-data might retry internally
-                        bhavcopy_index_save(current_date, DATA_DIR)
-                
-                if os.path.exists(file_path):
-                    df = pd.read_csv(file_path)
-                    df.columns = [c.strip().upper() for c in df.columns]
-                    # Index bhavcopy: 'Index Name', 'Closing Index Value', ...
-                    # Symbol for NIFTY 50 is usually 'Nifty 50'
-                    
-                    # Map common symbols to Index Names in Bhavcopy
-                    name_map = {
-                        "NIFTY": "Nifty 50",
-                        "BANKNIFTY": "Nifty Bank"
-                    }
-                    search_name = name_map.get(symbol, symbol)
-                    
-                    mask = (df['INDEX NAME'] == search_name)
-                    row = df[mask]
-                    
-                    if not row.empty:
-                        spot_data[current_date] = row.iloc[0]['CLOSING INDEX VALUE']
-            except Exception:
-                pass
-        
-        current_date += timedelta(days=1)
-    
+    name_map = {"NIFTY": "Nifty 50", "BANKNIFTY": "Nifty Bank"}
+    search_name = name_map.get(symbol, symbol).upper()
+    dates = [d.date() for d in pd.bdate_range(start_date, end_date)]
+
+    def process_date(d):
+        fname = f"ind_close_all_{d.strftime('%d%m%Y')}.csv"
+        file_path = os.path.join(DATA_DIR, fname)
+        try:
+            with lock_manager.get_lock(fname):
+                if not os.path.exists(file_path):
+                    lock_manager.rate_limit()
+                    bhavcopy_index_save(d, DATA_DIR)
+            if os.path.exists(file_path):
+                df = pd.read_csv(file_path)
+                df.columns = [c.strip().upper() for c in df.columns]
+                row = df[df['INDEX NAME'].str.strip().str.upper() == search_name]
+                if not row.empty:
+                    return d, float(row.iloc[0]['CLOSING INDEX VALUE'])
+        except Exception:
+            pass
+        return d, None
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+        spot_data = {d: v for d, v in executor.map(process_date, dates) if v is not None}
+
     if not spot_data:
         return pd.Series(dtype=float)
-        
     return pd.Series(spot_data).sort_index()
 
 def get_spot_from_futures(symbol, start_date, end_date):
@@ -714,147 +691,145 @@ def get_historical_options_data(symbol, start_date, end_date):
         
     return pd.concat(all_data, ignore_index=True)
 
+def _yf_close(ticker, start_date, end_date):
+    import yfinance as yf
+    with suppress_stdout_stderr():
+        df = yf.download(ticker, start=start_date, end=end_date + timedelta(days=1), progress=False)
+    if df.empty:
+        return pd.Series(dtype=float)
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+    return df['Close']
+
+
+def compute_atm_iv(options_df, spot_series):
+    """Daily ATM call IV from a Bhavcopy options panel, fully vectorized (one IV solve for all days)."""
+    opts = options_df.loc[options_df['OPTION_TYP'] == 'CE', ['TIMESTAMP', 'STRIKE_PR', 'EXPIRY_DT', 'CLOSE']].copy()
+    opts['TIMESTAMP'] = pd.to_datetime(opts['TIMESTAMP'])
+    opts['EXPIRY_DT'] = pd.to_datetime(opts['EXPIRY_DT'])
+    opts = opts[opts['EXPIRY_DT'] >= opts['TIMESTAMP']]
+    # Nearest expiry per day, then the strike closest to spot within it
+    opts = opts[opts['EXPIRY_DT'] == opts.groupby('TIMESTAMP')['EXPIRY_DT'].transform('min')]
+    opts['SPOT'] = opts['TIMESTAMP'].map(spot_series)
+    opts = opts.dropna(subset=['SPOT', 'CLOSE'])
+    if opts.empty:
+        return pd.Series(dtype=float)
+    opts['DIST'] = (opts['STRIKE_PR'] - opts['SPOT']).abs()
+    atm = opts.loc[opts.groupby('TIMESTAMP')['DIST'].idxmin()]
+    t = np.maximum((atm['EXPIRY_DT'] - atm['TIMESTAMP']).dt.days / 365.0, 0.001)
+    iv = utils.calculate_iv(atm['CLOSE'], atm['SPOT'], atm['STRIKE_PR'], t, 0.06, 'c')
+    return pd.Series(iv, index=atm['TIMESTAMP'].to_numpy()).sort_index()
+
+
 def process_market_data(symbol, start_date, end_date):
-    """
-    Orchestrates data fetching and processing.
-    """
-    # Convert string dates to date objects if needed
+    """Bhavcopy pipeline: spot (yfinance / Bhavcopy / futures fallback), VIX, RV and ATM IV."""
     if isinstance(start_date, str):
         start_date = pd.to_datetime(start_date).date()
     if isinstance(end_date, str):
         end_date = pd.to_datetime(end_date).date()
 
-    # 1. Get Spot Data
-    # Handle Indices specifically
-    INDEX_MAP = {
-        "NIFTY": "^NSEI",
-        "BANKNIFTY": "^NSEBANK"
-    }
-    
+    INDEX_MAP = {"NIFTY": "^NSEI", "BANKNIFTY": "^NSEBANK"}
+    is_index = symbol in INDEX_MAP
     spot_series = pd.Series(dtype=float)
-    
-    # Strategy 1: Try yfinance for Indices
-    if symbol in INDEX_MAP:
+
+    attempts = [
+        lambda: _yf_close(INDEX_MAP[symbol], start_date, end_date) if is_index else None,
+        lambda: get_spot_data_from_index_bhavcopy(symbol, start_date, end_date) if is_index else None,
+        lambda: get_spot_data_from_bhavcopy(symbol, start_date, end_date) if not is_index else None,
+        lambda: _yf_close(f"{symbol}.NS", start_date, end_date) if not is_index else None,
+        lambda: get_spot_from_futures(symbol, start_date, end_date),
+    ]
+    for attempt in attempts:
         try:
-            ticker = INDEX_MAP[symbol]
-            with suppress_stdout_stderr():
-                df = yf.download(ticker, start=start_date, end=end_date, progress=False)
-            if not df.empty:
-                 if isinstance(df.columns, pd.MultiIndex):
-                    df.columns = df.columns.get_level_values(0)
-                 spot_series = df['Close']
+            result = attempt()
         except Exception:
-            pass
-            
-    # Strategy 2: Try Index Bhavcopy (if Strategy 1 failed or not an index)
-    if spot_series.empty and symbol in INDEX_MAP:
-        spot_series = get_spot_data_from_index_bhavcopy(symbol, start_date, end_date)
-
-    # Strategy 3: Try Equity Bhavcopy (for stocks)
-    if spot_series.empty and symbol not in INDEX_MAP:
-        spot_series = get_spot_data_from_bhavcopy(symbol, start_date, end_date)
-    
-    # Strategy 4: Fallback to yfinance for stocks
-    if spot_series.empty and symbol not in INDEX_MAP:
-        try:
-            ticker = f"{symbol}.NS"
-            with suppress_stdout_stderr():
-                df = yf.download(ticker, start=start_date, end=end_date, progress=False)
-            if not df.empty:
-                 if isinstance(df.columns, pd.MultiIndex):
-                    df.columns = df.columns.get_level_values(0)
-                 spot_series = df['Close']
-        except:
-            pass
-
-    # Strategy 5: Fallback to Futures Price (Last Resort for Indices/Stocks)
-    if spot_series.empty:
-        # print(f"Falling back to Futures price for {symbol}")
-        spot_series = get_spot_from_futures(symbol, start_date, end_date)
+            result = None
+        if result is not None and not result.empty:
+            spot_series = result
+            break
 
     if spot_series.empty:
         return None, "No spot data found. Tried yfinance, Bhavcopy, and Futures."
-        
-    # 2. Get India VIX
+    spot_series.index = pd.to_datetime(spot_series.index).normalize()
+
     with suppress_stdout_stderr():
         vix_series = get_india_vix(start_date, end_date)
-    
-    # 3. Calculate RV
-    rv_series = utils.calculate_rv(spot_series)
-    
-    # 4. Get Options Data
-    options_df = get_historical_options_data(symbol, start_date, end_date)
-    
-    iv_series = pd.Series(dtype=float)
-    
-    if not options_df.empty:
-        # Pre-processing for IV calculation
-        options_df['EXPIRY_DT'] = pd.to_datetime(options_df['EXPIRY_DT'])
-        
-        daily_ivs = {}
-        
-        # Iterate over spot series dates to ensure alignment
-        for date_val in spot_series.index:
-            # Handle both datetime and date objects in index
-            date_date = date_val.date() if hasattr(date_val, 'date') else date_val
-            
-            if date_date not in options_df['TIMESTAMP'].values:
-                continue
-                
-            spot_price = spot_series.loc[date_val]
-            if pd.isna(spot_price):
-                continue
+    if not vix_series.empty:
+        vix_series.index = pd.to_datetime(vix_series.index)
 
-            # Find ATM Strike
-            day_opts = options_df[options_df['TIMESTAMP'] == date_date]
-            if day_opts.empty:
-                continue
-                
-            available_strikes = day_opts['STRIKE_PR'].unique()
-            if len(available_strikes) == 0:
-                continue
-                
-            atm_strike = min(available_strikes, key=lambda x: abs(x - spot_price))
-            
-            # Get nearest expiry (monthly)
-            valid_expiries = day_opts[day_opts['EXPIRY_DT'].dt.date >= date_date]['EXPIRY_DT'].unique()
-            if len(valid_expiries) == 0:
-                continue
-            near_expiry = min(valid_expiries)
-            
-            # Get Option Price for ATM Strike and Near Expiry
-            opt_row = day_opts[
-                (day_opts['STRIKE_PR'] == atm_strike) & 
-                (day_opts['EXPIRY_DT'] == near_expiry) & 
-                (day_opts['OPTION_TYP'] == 'CE')
-            ]
-            
-            if opt_row.empty:
-                continue
-                
-            price = opt_row.iloc[0]['CLOSE']
-            
-            # Calculate Time to Expiry in years
-            days_to_expiry = (near_expiry.date() - date_date).days
-            t = max(days_to_expiry / 365.0, 0.001)
-            
-            # Risk free rate - assume 6%
-            r = 0.06
-            
-            try:
-                iv = utils.calculate_iv(price, spot_price, atm_strike, t, r, 'c')
-                # py_vollib_vectorized returns numpy array, extract float
-                if isinstance(iv, np.ndarray):
-                    iv = iv[0]
-                daily_ivs[date_val] = iv
-            except Exception:
-                continue
-            
-        iv_series = pd.Series(daily_ivs)
-    
+    options_df = get_historical_options_data(symbol, start_date, end_date)
+    iv_series = compute_atm_iv(options_df, spot_series) if not options_df.empty else pd.Series(dtype=float)
+
     return {
         'spot': spot_series,
         'vix': vix_series,
-        'rv': rv_series,
-        'iv': iv_series
+        'rv': utils.calculate_rv(spot_series),
+        'iv': iv_series,
     }, None
+
+
+SOURCES = ["Sensibull (Unofficial)", "DhanHQ", "Open Source (Bhavcopy)", "Zerodha Kite API",
+           "IndianAPI.in", "TradingView (Unofficial)", "Demo (synthetic)"]
+
+
+def synthetic_market(symbol="DEMO", end_date=None, n=600):
+    """Offline demo data: regime-switching GBM with an IV that carries a noisy volatility premium."""
+    seed = sum(map(ord, symbol))
+    rng = np.random.default_rng(seed)
+    regime_vol = np.repeat(rng.choice([0.10, 0.16, 0.28], size=n // 45 + 1), 45)[:n]
+    drift = np.repeat(rng.normal(0, 0.0015, size=n // 60 + 1), 60)[:n]
+    rets = drift + regime_vol / np.sqrt(252) * rng.standard_normal(n)
+    close = 20000 * np.exp(np.cumsum(rets))
+    iv = regime_vol * 100 * (1.1 + 0.1 * rng.standard_normal(n))
+    idx = pd.bdate_range(end=pd.Timestamp(end_date or date.today()), periods=n)
+    return pd.DataFrame({"close": close, "iv": iv, "vix": iv * 0.9}, index=idx)
+
+
+WARMUP_DAYS = 400  # history kept before start_date (when a source returns it) so rolling features are warm
+
+
+def load_market_frame(source, symbol, start_date, end_date, kite=None, kite_token=None, indian_api_key=None):
+    """Single entry point for every source. Returns (DataFrame, error message or None).
+
+    The frame has a normalized DatetimeIndex, `close`, and optionally `iv`, `vix`, `ivp`.
+    Sources that return more than the requested range keep up to WARMUP_DAYS before
+    `start_date`; callers compute features on the whole frame and trim for display.
+    """
+    if source == "Sensibull (Unofficial)":
+        df = fetch_sensibull_data(symbol)
+    elif source == "DhanHQ":
+        df = fetch_dhan_data(symbol, start_date, end_date)
+    elif source == "IndianAPI.in":
+        if not indian_api_key:
+            return pd.DataFrame(), "Enter your IndianAPI key in the sidebar."
+        df = fetch_indianapi_data(symbol, indian_api_key)
+    elif source == "TradingView (Unofficial)":
+        df = fetch_tv_data(symbol)
+    elif source == "Demo (synthetic)":
+        df = synthetic_market(symbol, end_date, n=max(600, len(pd.bdate_range(start_date, end_date)) + 300))
+    elif source == "Zerodha Kite API":
+        if kite is None or kite_token is None:
+            return pd.DataFrame(), "Log in to Kite first."
+        df = fetch_kite_historical_data(kite, kite_token, start_date, end_date)
+    else:
+        data, error = process_market_data(symbol, start_date, end_date)
+        if error:
+            return pd.DataFrame(), error
+        df = pd.DataFrame({'close': data['spot']})
+        if not data['iv'].empty:
+            df['iv'] = data['iv']
+        if not data['vix'].empty:
+            df['vix'] = data['vix']
+
+    if df is None or df.empty or 'close' not in df.columns:
+        return pd.DataFrame(), f"No data returned from {source} for {symbol}."
+    df = df.copy()
+    df.index = pd.to_datetime(df.index).normalize()
+    df = df[~df.index.duplicated(keep='last')].sort_index()
+    keep = [c for c in ('close', 'iv', 'vix', 'ivp') if c in df.columns]
+    warm_start = pd.Timestamp(start_date) - pd.Timedelta(days=WARMUP_DAYS)
+    df = df.loc[(df.index >= warm_start) & (df.index <= pd.Timestamp(end_date)), keep]
+    df = df.dropna(subset=['close'])
+    if df.empty or df.index[-1] < pd.Timestamp(start_date):
+        return df, "No data in the selected date range."
+    return df, None
