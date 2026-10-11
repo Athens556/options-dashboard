@@ -1,7 +1,11 @@
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
 import requests
 import pandas as pd
 
-API_KEY = "sk-live-VrBVAfOVG65kGKovMvJXnDkTjVvYJAMZDuqJ4oMv"
+API_KEY = os.getenv("INDIANAPI_KEY", "")  # set in .env — never commit keys
 BASE_URL = "https://stock.indianapi.in"
 
 def test_indianapi_fetch(symbol):
