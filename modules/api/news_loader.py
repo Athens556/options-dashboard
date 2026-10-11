@@ -1,5 +1,3 @@
-import feedparser
-from pytrends.request import TrendReq
 import pandas as pd
 from datetime import datetime
 import urllib.parse
@@ -15,7 +13,10 @@ def fetch_google_news(symbol, limit=5):
         encoded_query = urllib.parse.quote(query)
         url = f"https://news.google.com/rss/search?q={encoded_query}&hl=en-IN&gl=IN&ceid=IN:en"
         
-        feed = feedparser.parse(url)
+        import feedparser
+        import requests
+        response = requests.get(url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
+        feed = feedparser.parse(response.content)
         
         articles = []
         for entry in feed.entries[:limit]:

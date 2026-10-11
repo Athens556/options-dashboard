@@ -10,21 +10,20 @@ A comprehensive, modular dashboard for analyzing options market data, identifyin
 
 ## Features
 
-- **Multi-Source Data Loading**: Supports NSE Bhavcopy (UDiFF & Legacy), Zerodha Kite, DhanHQ, and more.
-- **Advanced Market State Analysis**:
-    - **Regime Detection**: Automatically classifies market into Trending/Ranging and Low/High Volatility.
-    - **Guardrails**: Enforces strict causality to prevent look-ahead bias in backtests.
-    - **Narrative Awareness**: Integrates external signals (News, Events) into the decision framework.
-- **Strategy Backtesting**: Simulate strategies like Iron Condor, Straddles, and Spreads against historical data.
-- **Active Learning System (Experimental)**:
-    - **Context Encoder**: Uses a transformer-based model to learn "Token Attention" — which market factors matter most for distinct strategies.
-    - **Tokenization**: Converts complex market states into discrete, interpretable tokens (e.g., `VOL_HIGH`, `TRENDING_UP`).
+- **Fast, cached data layer**: Sensibull, DhanHQ, NSE Bhavcopy (UDiFF & legacy), Zerodha Kite, IndianAPI, TradingView and an offline **Demo** source, all behind one loader that returns the same frame. Results are cached, so moving a slider doesn't re-download anything. Heavy SDKs load only when their source is picked.
+- **Dashboard**: price with 20/50-day moving averages, implied vs realized vol, IV percentile and India VIX in one linked chart; KPI tiles; a **regime map** of the tokenizer over time; news.
+- **Mini tokenizer**: each day becomes a 7-token "market sentence", one token per slot: `TREND · MOMENTUM · IV_LEVEL · IV_FLOW · VRP · RV_REGIME · VIX` (e.g. `TREND_UP · MOM_FLAT · IV_HIGH · IV_FALLING · VRP_RICH · RV_STEADY · VIX_MID`). Trend and momentum are measured in units of the stock's own volatility, so NIFTY and a high-beta stock read on the same scale.
+- **Market Gym**
+    - **Vectorized options backtest**: Iron Condor, Long Straddle, Bull Call and Bear Put spreads, with strikes set in σ-units of the expected move and every leg priced with Black-Scholes at entry IV. Every strategy is simulated on *every* day (shadow trades), and the rule-based entries are flagged.
+    - **Context micro-transformer**: `[CLS, STRAT, 7 tokens]` → P(win). It trains on actual trade outcomes, with a chronological, purged validation split (AUC and accuracy vs baseline are reported honestly). It explains itself two ways: attention (what it looks at) and masking impact (which way each token pushes the odds).
+    - **Bayesian ranking**: today's win rate in the same core regime (TREND + IV_LEVEL + VRP), with the model's prediction as the prior.
+    - **Causality audit**: features are recomputed on truncated history to prove there is no look-ahead.
 
 > [!WARNING]
 > **API Disclaimer**: Some data sources included (e.g., Sensibull, TradingView) effectively use unofficial APIs. They are provided for demonstration purposes and may break at any time or violate Terms of Service. Use official APIs (DhanHQ, Kite) for reliability.
 
 > [!NOTE]
-> **IV Data Availability**: Implied Volatility (IV) data is strictly calculated using Black-Scholes models on NSE Options Chain data (Bhavcopy). Some external APIs (like IndianAPI, Dhan) do not currently provide historical IV data, so volatility features may be limited for those sources.
+> **IV Data Availability**: Sensibull provides ATM IV directly. For Bhavcopy, IV is solved from the near-expiry ATM call with a vectorized Black-Scholes solver. Sources without options data (IndianAPI, Dhan, Kite, TradingView) fall back to 20-day realized vol as an IV proxy, and the app flags it.
 
 ## Installation
 
@@ -54,12 +53,21 @@ Run the Streamlit application:
 streamlit run app.py
 ```
 
+Pick **Demo (synthetic)** as the data source to try everything offline. In **Market Gym**, hit *Run gym*: the backtest takes milliseconds, and training the transformer takes a few seconds (toggle *Retrain model*). Trades are stored in `market_research.db` (upserted, so re-runs never double-count) and model weights in `data/models/`. Training on several symbols makes the model generalise better.
+
+Tests (offline, synthetic data):
+
+```bash
+python -m pytest tests/test_core.py -q
+```
+
 ## Project Structure
 
-- **`modules/dashboard`**: Core business logic (Market State, Backtest, Strategy).
-- **`modules/api`**: Data fetching adapters (NSE, Dhan, Kite).
-- **`modules/ml`**: Machine learning components (Tokenization, Context Encoder).
-- **`tests`**: Verification scripts.
+- **`modules/api`**: Data adapters (`load_market_frame` is the single entry point).
+- **`modules/dashboard`**: Features (`market_state`), strategies, vectorized backtest, SQLite store.
+- **`modules/ml`**: Tokenizer, context micro-transformer, trainer.
+- **`modules/ui`**: Theme and Plotly chart builders.
+- **`tests`**: `test_core.py` (offline pipeline tests) plus ad-hoc API probe scripts.
 
 ## Disclaimer
 

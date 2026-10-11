@@ -1,9 +1,16 @@
-streamlit
-pandas
-numpy
-jugaad-data
+streamlit>=1.50
+pandas>=2.0
+numpy>=1.24
+scipy>=1.10
+plotly>=5.20
+requests
+python-dotenv
+feedparser
+torch>=2.1
+# Optional per data source (imported lazily, only when that source is used)
 yfinance
-py_vollib_vectorized
-plotly
-scipy
+jugaad-data
 kiteconnect
+dhanhq
+# TradingView: pip install git+https://github.com/rongardF/tvdatafeed.git
+pytrends
